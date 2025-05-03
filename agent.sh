@@ -2,7 +2,7 @@
 
 NZ_BASE_PATH="/opt/nezha"
 NZ_AGENT_PATH="${NZ_BASE_PATH}/agent"
-SCREEN_SESSION_NAME="nezha_agent"
+SCREEN_NAME="nezha_agent"
 
 red='\033[0;31m'
 green='\033[0;32m'
@@ -35,70 +35,40 @@ sudo() {
     fi
 }
 
-detect_pkg_manager() {
-    if command -v apt >/dev/null 2>&1; then
-        PKG_MANAGER="apt"
-    elif command -v apk >/dev/null 2>&1; then
-        PKG_MANAGER="apk"
-    elif command -v yum >/dev/null 2>&1; then
-        PKG_MANAGER="yum"
-    elif command -v dnf >/dev/null 2>&1; then
-        PKG_MANAGER="dnf"
-    else
-        err "Unable to determine package manager. Please install screen manually."
-        exit 1
-    fi
-}
-
-install_screen() {
-    info "Installing screen using $PKG_MANAGER..."
-    case "$PKG_MANAGER" in
-        apt)
-            if ! sudo apt update && sudo apt install -y screen; then
-                err "Failed to install screen via apt"
-                exit 1
-            fi
-            ;;
-        apk)
-            if ! sudo apk add screen; then
-                err "Failed to install screen via apk"
-                exit 1
-            fi
-            ;;
-        yum)
-            if ! sudo yum install -y screen; then
-                err "Failed to install screen via yum"
-                exit 1
-            fi
-            ;;
-        dnf)
-            if ! sudo dnf install -y screen; then
-                err "Failed to install screen via dnf"
-                exit 1
-            fi
-            ;;
-        *)
-            err "Unsupported package manager: $PKG_MANAGER"
-            exit 1
-            ;;
-    esac
-    success "screen installed successfully"
-}
-
 deps_check() {
-    deps="wget unzip grep screen"
+    deps="wget unzip grep"
+    set -- "$api_list"
     for dep in $deps; do
         if ! command -v "$dep" >/dev/null 2>&1; then
-            if [ "$dep" = "screen" ]; then
-                info "screen not found, attempting to install..."
-                detect_pkg_manager
-                install_screen
-            else
-                err "$dep not found, please install it first."
-                exit 1
-            fi
+            err "$dep not found, please install it first."
+            exit 1
         fi
     done
+
+    # Check screen and install if not found
+    if ! command -v screen >/dev/null 2>&1; then
+        info "Screen is not installed, trying to install..."
+        if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y screen
+        elif command -v yum >/dev/null 2>&1; then
+            sudo yum install -y screen
+        elif command -v apk >/dev/null 2>&1; then
+            sudo apk add screen
+        elif command -v pacman >/dev/null 2>&1; then
+            sudo pacman -S --noconfirm screen
+        else
+            err "Could not install screen automatically. Please install screen manually."
+            exit 1
+        fi
+        
+        if ! command -v screen >/dev/null 2>&1; then
+            err "Failed to install screen. Please install it manually."
+            exit 1
+        else
+            success "Screen installed successfully."
+        fi
+    fi
 }
 
 geo_check() {
@@ -107,7 +77,7 @@ geo_check() {
     set -- "$api_list"
     for url in $api_list; do
         text="$(curl -A "$ua" -m 10 -s "$url")"
-        endpoint="$(echo "$text" | grep -o 'h=[^ ]*' | cut -d= -f2 | head -1)"
+        endpoint="$(echo "$text" | sed -n 's/.*h=\([^ ]*\).*/\1/p')"
         if echo "$text" | grep -qw 'CN'; then
             isCN=true
             break
@@ -162,7 +132,7 @@ env_check() {
             os="freebsd"
             ;;
         *)
-            err "Unknown system: $system"
+            err "Unknown operating system: $system"
             exit 1
             ;;
     esac
@@ -172,6 +142,7 @@ init() {
     deps_check
     env_check
 
+    ## China_IP
     if [ -z "$CN" ]; then
         geo_check
         if [ -n "$isCN" ]; then
@@ -186,22 +157,25 @@ init() {
     fi
 }
 
+stop_agent() {
+    # Check if screen session exists and kill it
+    if screen -list | grep -q "$SCREEN_NAME"; then
+        screen -S "$SCREEN_NAME" -X quit
+        info "Stopped nezha-agent screen session."
+    fi
+}
+
 install() {
     echo "Installing..."
 
     if [ -z "$CN" ]; then
         NZ_AGENT_URL="https://${GITHUB_URL}/nezhahq/agent/releases/latest/download/nezha-agent_${os}_${os_arch}.zip"
     else
-        _version=$(curl -m 10 -sL "https://gitee.com/api/v5/repos/naibahq/agent/releases/latest" | awk -F '"' '/tag_name/ {print substr($4,2)}')
+        _version=$(curl -m 10 -sL "https://gitee.com/api/v5/repos/naibahq/agent/releases/latest" | awk -F '"' '{for(i=1;i<=NF;i++){if($i=="tag_name"){print $(i+2)}}}')
         NZ_AGENT_URL="https://${GITHUB_URL}/naibahq/agent/releases/download/${_version}/nezha-agent_${os}_${os_arch}.zip"
     fi
 
-    _cmd="wget -T 60 -O /tmp/nezha-agent_${os}_${os_arch}.zip $NZ_AGENT_URL 2>&1 | tee /tmp/wget.log"
-    if ! eval "$_cmd"; then
-        err "Download failed. Log:"
-        cat /tmp/wget.log
-        exit 1
-    fi
+    _cmd="wget -T 60 -O /tmp/nezha-agent_${os}_${os_arch}.zip $NZ_AGENT_URL >/dev/null 2>&1"
     if ! eval "$_cmd"; then
         err "Download nezha-agent release failed, check your network connectivity"
         exit 1
@@ -228,44 +202,113 @@ install() {
         exit 1
     fi
 
-    start_cmd="env NZ_UUID=$NZ_UUID NZ_SERVER=$NZ_SERVER NZ_CLIENT_SECRET=$NZ_CLIENT_SECRET NZ_TLS=$NZ_TLS NZ_DISABLE_AUTO_UPDATE=$NZ_DISABLE_AUTO_UPDATE NZ_DISABLE_FORCE_UPDATE=$NZ_DISABLE_FORCE_UPDATE NZ_DISABLE_COMMAND_EXECUTE=$NZ_DISABLE_COMMAND_EXECUTE NZ_SKIP_CONNECTION_COUNT=$NZ_SKIP_CONNECTION_COUNT ${NZ_AGENT_PATH}/nezha-agent"
+    # Stop existing agent if running
+    stop_agent
 
-    if screen -ls | grep -q "$SCREEN_SESSION_NAME"; then
-        info "Found existing screen session, killing it..."
-        screen -S "$SCREEN_SESSION_NAME" -X quit
-        sleep 1
-    fi
+    # Create config file
+    cat > "$path" << EOF
+debug: false
+server: "${NZ_SERVER}"
+secret: "${NZ_CLIENT_SECRET}"
+tls: ${NZ_TLS:-false}
+disable_auto_update: ${NZ_DISABLE_AUTO_UPDATE:-false}
+disable_force_update: ${DISABLE_FORCE_UPDATE:-false}
+disable_command_execute: ${NZ_DISABLE_COMMAND_EXECUTE:-false}
+skip_conn: ${NZ_SKIP_CONNECTION_COUNT:-false}
+EOF
 
-    info "Starting nezha-agent in screen session..."
-    if ! screen -dmS "$SCREEN_SESSION_NAME" $start_cmd; then
-        err "Failed to start screen session"
-        exit 1
-    fi
+    chmod +x "$NZ_AGENT_PATH/nezha-agent"
 
-    sleep 2
-    if pgrep -f "nezha-agent" > /dev/null; then
-        success "nezha-agent successfully installed and running in screen session."
-        info "Attach to the session with: ${green}screen -r $SCREEN_SESSION_NAME${plain}"
+    # Create a startup script
+    startup_script="$NZ_AGENT_PATH/start-agent.sh"
+    cat > "$startup_script" << EOF
+#!/bin/sh
+cd "$NZ_AGENT_PATH"
+./nezha-agent -c "$path"
+EOF
+    chmod +x "$startup_script"
+
+    # Start the agent in a screen session
+    screen -dmS "$SCREEN_NAME" "$startup_script"
+    
+    if screen -list | grep -q "$SCREEN_NAME"; then
+        success "nezha-agent successfully installed and running in screen session '$SCREEN_NAME'"
+        info "To check agent status, use: screen -r $SCREEN_NAME"
+        info "To detach from screen session, press Ctrl+A then D"
     else
-        err "Failed to start nezha-agent"
+        err "Failed to start nezha-agent in screen session"
         exit 1
     fi
 }
 
 uninstall() {
-    if screen -ls | grep -q "$SCREEN_SESSION_NAME"; then
-        info "Stopping screen session..."
-        screen -S "$SCREEN_SESSION_NAME" -X quit
-    fi
+    stop_agent
     
-    sudo rm -rf "$NZ_AGENT_PATH"
-    info "Uninstallation completed."
+    if [ -d "$NZ_AGENT_PATH" ]; then
+        sudo rm -rf "$NZ_AGENT_PATH"
+        success "Uninstallation completed."
+    else
+        info "Agent directory not found. Nothing to uninstall."
+    fi
 }
 
-if [ "$1" = "uninstall" ]; then
-    uninstall
-    exit
-fi
+status() {
+    if screen -list | grep -q "$SCREEN_NAME"; then
+        success "nezha-agent is running in screen session '$SCREEN_NAME'"
+    else
+        err "nezha-agent is not running"
+    fi
+}
+
+restart() {
+    stop_agent
+    info "Starting nezha-agent..."
+    
+    # Find the latest config file
+    config_file=$(find "$NZ_AGENT_PATH" -type f -name "config*.yml" | sort -r | head -n 1)
+    
+    if [ -z "$config_file" ]; then
+        err "No configuration file found. Please reinstall."
+        exit 1
+    fi
+    
+    # Start the agent in a screen session
+    startup_script="$NZ_AGENT_PATH/start-agent.sh"
+    cat > "$startup_script" << EOF
+#!/bin/sh
+cd "$NZ_AGENT_PATH"
+./nezha-agent -c "$config_file"
+EOF
+    chmod +x "$startup_script"
+    
+    screen -dmS "$SCREEN_NAME" "$startup_script"
+    
+    if screen -list | grep -q "$SCREEN_NAME"; then
+        success "nezha-agent restarted successfully"
+    else
+        err "Failed to restart nezha-agent"
+        exit 1
+    fi
+}
+
+case "$1" in
+    uninstall)
+        uninstall
+        exit
+        ;;
+    status)
+        status
+        exit
+        ;;
+    restart)
+        restart
+        exit
+        ;;
+    stop)
+        stop_agent
+        exit
+        ;;
+esac
 
 init
 install
