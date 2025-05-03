@@ -22,3 +22,9 @@
 
 ```bash
 curl -L https://raw.githubusercontent.com/fxlqwq/nezhahq_scripts_without_service/refs/heads/main/agent.sh -o agent.sh && chmod +x agent.sh && env NZ_SERVER=your_dashboard.com:5555 NZ_TLS=false NZ_CLIENT_SECRET=your_secret_key ./agent.sh
+```
+
+#### 国内用户可以使用
+
+```bash
+curl -L https://raw.bgithub.xyz/fxlqwq/nezhahq_scripts_without_service/refs/heads/main/agent.sh -o agent.sh && chmod +x agent.sh && env NZ_SERVER=your_dashboard.com:5555 NZ_TLS=false NZ_CLIENT_SECRET=your_secret_key ./agent.sh
